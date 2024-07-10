@@ -15,10 +15,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	kuikenixiov1 "github.com/enix/kube-image-keeper/api/v1"
-	"github.com/enix/kube-image-keeper/controllers"
+	kuikenixiov1 "github.com/enix/kube-image-keeper/api/core/v1"
+	kuikv1alpha1 "github.com/enix/kube-image-keeper/api/kuik/v1alpha1"
 	"github.com/enix/kube-image-keeper/internal"
+	kuikController "github.com/enix/kube-image-keeper/internal/controller"
+	"github.com/enix/kube-image-keeper/internal/controller/core"
+	"github.com/enix/kube-image-keeper/internal/controller/kuik"
 	"github.com/enix/kube-image-keeper/internal/registry"
 	"github.com/enix/kube-image-keeper/internal/scheme"
 	//+kubebuilder:scaffold:imports
@@ -35,6 +39,7 @@ func main() {
 	var expiryDelay uint
 	var proxyPort int
 	var ignoreImages internal.RegexpArrayFlags
+	var ignorePullPolicyAlways bool
 	var architectures internal.ArrayFlags
 	var maxConcurrentCachedImageReconciles int
 	var insecureRegistries internal.ArrayFlags
@@ -47,6 +52,7 @@ func main() {
 	flag.UintVar(&expiryDelay, "expiry-delay", 30, "The delay in days before deleting an unused CachedImage.")
 	flag.IntVar(&proxyPort, "proxy-port", 8082, "The port on which the registry proxy accepts connections on each host.")
 	flag.Var(&ignoreImages, "ignore-images", "Regex that represents images to be excluded (this flag can be used multiple times).")
+	flag.BoolVar(&ignorePullPolicyAlways, "ignore-pull-policy-always", true, "Ignore containers that are configured with imagePullPolicy: Always")
 	flag.Var(&architectures, "arch", "Architecture of image to put in cache (this flag can be used multiple times).")
 	flag.StringVar(&registry.Endpoint, "registry-endpoint", "kube-image-keeper-registry:5000", "The address of the registry where cached images are stored.")
 	flag.IntVar(&maxConcurrentCachedImageReconciles, "max-concurrent-cached-image-reconciles", 3, "Maximum number of CachedImages that can be handled and reconciled at the same time (put or removed from cache).")
@@ -82,7 +88,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controllers.CachedImageReconciler{
+	if err = (&kuik.CachedImageReconciler{
 		Client:             mgr.GetClient(),
 		Scheme:             mgr.GetScheme(),
 		Recorder:           mgr.GetEventRecorderFor("cachedimage-controller"),
@@ -95,7 +101,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "CachedImage")
 		os.Exit(1)
 	}
-	if err = (&controllers.PodReconciler{
+	if err = (&core.PodReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
@@ -103,30 +109,50 @@ func main() {
 		os.Exit(1)
 	}
 	imageRewriter := kuikenixiov1.ImageRewriter{
-		Client:       mgr.GetClient(),
-		IgnoreImages: ignoreImages,
-		ProxyPort:    proxyPort,
+		Client:                 mgr.GetClient(),
+		IgnoreImages:           ignoreImages,
+		IgnorePullPolicyAlways: ignorePullPolicyAlways,
+		ProxyPort:              proxyPort,
+		Decoder:                admission.NewDecoder(mgr.GetScheme()),
 	}
 	mgr.GetWebhookServer().Register("/mutate-core-v1-pod", &webhook.Admission{Handler: &imageRewriter})
+	if err = (&kuikv1alpha1.CachedImage{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "CachedImage")
+		os.Exit(1)
+	}
+	if err = (&kuik.RepositoryReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("epository-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Repository")
+		os.Exit(1)
+	}
 	//+kubebuilder:scaffold:builder
 
-	if err := mgr.AddHealthzCheck("healthz", controllers.MakeChecker(controllers.Healthz)); err != nil {
+	err = mgr.Add(&kuikenixiov1.PodInitializer{Client: mgr.GetClient()})
+	if err != nil {
+		setupLog.Error(err, "unable to setup PodInitializer")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", kuikController.MakeChecker(kuikController.Healthz)); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", controllers.MakeChecker(controllers.Readyz)); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", kuikController.MakeChecker(kuikController.Readyz)); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 
-	controllers.SetLeader(false)
+	kuikController.SetLeader(false)
 	go func() {
 		<-mgr.Elected()
-		controllers.SetLeader(true)
+		kuikController.SetLeader(true)
 	}()
 
-	controllers.ProbeAddr = probeAddr
-	controllers.RegisterMetrics(mgr.GetClient())
+	kuikController.ProbeAddr = probeAddr
+	kuikController.RegisterMetrics(mgr.GetClient())
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

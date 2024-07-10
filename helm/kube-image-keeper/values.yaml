@@ -4,8 +4,6 @@
 
 # -- Delay in days before deleting an unused CachedImage
 cachedImagesExpiryDelay: 30
-# -- If true, install the CRD
-installCRD: true
 # -- List of architectures to put in cache
 architectures: [amd64]
 # -- Insecure registries to allow to cache and proxify images from
@@ -22,7 +20,7 @@ controllers:
   replicas: 2
   image:
     # -- Controller image repository. Also available: `quay.io/enix/kube-image-keeper`
-    repository: enix/kube-image-keeper
+    repository: ghcr.io/enix/kube-image-keeper
     # -- Controller image pull policy
     pullPolicy: IfNotPresent
     # -- Controller image tag. Default chart appVersion
@@ -59,6 +57,11 @@ controllers:
     httpGet:
       path: /readyz
       port: 8081
+  # -- Liveness probe definition for the controllers pod
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8081
   resources:
     requests:
       # -- Cpu requests for the controller pod
@@ -72,10 +75,11 @@ controllers:
       memory: "512Mi"
   webhook:
     # -- Don't enable image caching for pods scheduled into these namespaces
-    ignoredNamespaces:
-      - kube-system
+    ignoredNamespaces: []
     # -- Don't enable image caching if the image match the following regexes
     ignoredImages: []
+    # -- Don't enable image caching if the image is configured with imagePullPolicy: Always
+    ignorePullPolicyAlways: true
     # -- If true, create the issuer used to issue the webhook certificate
     createCertificateIssuer: true
     # -- Issuer reference to issue the webhook certificate, ignored if createCertificateIssuer is true
@@ -100,15 +104,19 @@ controllers:
 proxy:
   image:
     # -- Proxy image repository. Also available: `quay.io/enix/kube-image-keeper`
-    repository: enix/kube-image-keeper
+    repository: ghcr.io/enix/kube-image-keeper
     # -- Proxy image pull policy
     pullPolicy: IfNotPresent
     # -- Proxy image tag. Default chart appVersion
     tag: ""
+  # -- whether to run the proxy daemonset in hostNetwork mode
+  hostNetwork: false
   # -- hostPort used for the proxy pod
   hostPort: 7439
   # -- hostIp used for the proxy pod
   hostIp: "127.0.0.1"
+  # -- metricsPort used for the proxy pod (to expose prometheus metrics)
+  metricsPort: 8080
   # -- Verbosity level for the proxy pod
   verbosity: 1
   # -- Specify secrets to be used when pulling proxy image
@@ -159,8 +167,13 @@ proxy:
   # -- Readiness probe definition for the proxy pod
   readinessProbe:
     httpGet:
-      path: /v2/
-      port: 8082
+      path: /readyz
+      port: 7439
+  # -- Liveness probe definition for the proxy pod
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 7439
   resources:
     requests:
       # -- Cpu requests for the proxy pod
@@ -195,10 +208,12 @@ registry:
     # -- Registry image pull policy
     pullPolicy: IfNotPresent
     # -- Registry image tag
-    tag: "2.8.3"
+    tag: "2.8"
   # -- Number of replicas for the registry pod
   replicas: 1
   persistence:
+    # -- AccessMode for persistent volume
+    accessModes: ReadWriteOnce
     # -- If true, enable persistent storage (ignored when using minio or S3)
     enabled: false
     # -- StorageClass for persistent volume
@@ -219,6 +234,13 @@ registry:
     schedule: "0 0 * * 0"
     # -- If true, delete untagged manifests. Default to false since there is a known bug in **docker distribution** garbage collect job.
     deleteUntagged: false
+    image:
+      # -- Cronjob image repository
+      repository: bitnami/kubectl
+      # -- Cronjob image pull policy
+      pullPolicy: IfNotPresent
+      # -- Cronjob image tag. Default 'latest'
+      tag: "latest"
   service:
     # -- Registry service type
     type: ClusterIP
@@ -228,6 +250,11 @@ registry:
   env: []
   # -- Readiness probe definition for the registry pod
   readinessProbe:
+    httpGet:
+      path: /v2/
+      port: 5000
+    # -- Liveness probe definition for the proxy pod
+  livenessProbe:
     httpGet:
       path: /v2/
       port: 5000

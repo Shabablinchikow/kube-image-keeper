@@ -1,7 +1,8 @@
-{{- if .Values.installCRD -}}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.15.0
   name: cachedimages.kuik.enix.io
 spec:
   group: kuik.enix.io
@@ -15,6 +16,9 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Status
+      type: string
     - jsonPath: .status.isCached
       name: Cached
       type: boolean
@@ -36,14 +40,19 @@ spec:
         description: CachedImage is the Schema for the cachedimages API
         properties:
           apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation
-              of an object. Servers should convert recognized schemas to the latest
-              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
             type: string
           kind:
-            description: 'Kind is a string value representing the REST resource this
-              object represents. Servers may infer this from the endpoint the client
-              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
             type: string
           metadata:
             type: object
@@ -52,12 +61,6 @@ spec:
             properties:
               expiresAt:
                 format: date-time
-                type: string
-              pullSecretNames:
-                items:
-                  type: string
-                type: array
-              pullSecretsNamespace:
                 type: string
               retain:
                 type: boolean
@@ -69,13 +72,32 @@ spec:
           status:
             description: CachedImageStatus defines the observed state of CachedImage
             properties:
+              availableUpstream:
+                type: boolean
+              digest:
+                type: string
               isCached:
                 type: boolean
+              lastSeenUpstream:
+                format: date-time
+                type: string
+              lastSuccessfulPull:
+                format: date-time
+                type: string
+              lastSync:
+                format: date-time
+                type: string
+              phase:
+                type: string
+              upToDate:
+                type: boolean
+              upstreamDigest:
+                type: string
               usedBy:
                 properties:
                   count:
-                    description: jsonpath function .length() is not implemented, so
-                      the count field is required to display pods count in additionalPrinterColumns
+                    description: |-
+                      jsonpath function .length() is not implemented, so the count field is required to display pods count in additionalPrinterColumns
                       see https://github.com/kubernetes-sigs/controller-tools/issues/447
                     type: integer
                   pods:
@@ -92,10 +114,3 @@ spec:
     storage: true
     subresources:
       status: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []
-{{- end -}}

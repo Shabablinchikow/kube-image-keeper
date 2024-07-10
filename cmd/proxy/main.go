@@ -21,6 +21,7 @@ import (
 
 var (
 	kubeconfig         string
+	proxyAddr          string
 	metricsAddr        string
 	rateLimitQPS       int
 	rateLimitBurst     int
@@ -33,8 +34,8 @@ func initFlags() {
 	if err := flag.Set("logtostderr", "true"); err != nil {
 		fmt.Fprint(os.Stderr, "could not enable logging to stderr")
 	}
+	flag.StringVar(&proxyAddr, "bind-address", ":8082", "The address the proxy registry endpoint binds to.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Absolute path to the kubeconfig file")
 	flag.StringVar(&registry.Endpoint, "registry-endpoint", "kube-image-keeper-registry:5000", "The address of the registry where cached images are stored.")
 	flag.IntVar(&rateLimitQPS, "kube-api-rate-limit-qps", 0, "Kubernetes API request rate limit")
 	flag.IntVar(&rateLimitBurst, "kube-api-rate-limit-burst", 0, "Kubernetes API request burst")
@@ -58,13 +59,17 @@ func main() {
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
 
-	klog.Info("starting")
-
 	if err != nil {
 		panic(err)
 	}
 
-	restMapper, err := apiutil.NewDynamicRESTMapper(config, apiutil.WithLazyDiscovery)
+	klog.Info("starting")
+
+	httpClient, err := rest.HTTPClientFor(config)
+	if err != nil {
+		panic(err)
+	}
+	restMapper, err := apiutil.NewDynamicRESTMapper(config, httpClient)
 	if err != nil {
 		panic(err)
 	}
@@ -88,5 +93,5 @@ func main() {
 		panic(fmt.Errorf("could not load root certificate authorities: %s", err))
 	}
 
-	<-proxy.New(k8sClient, metricsAddr, []string(insecureRegistries), rootCAs).Run()
+	<-proxy.New(k8sClient, metricsAddr, []string(insecureRegistries), rootCAs).Run(proxyAddr)
 }

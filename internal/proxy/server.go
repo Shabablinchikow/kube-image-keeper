@@ -12,14 +12,18 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/docker/distribution/reference"
-	kuikenixiov1alpha1 "github.com/enix/kube-image-keeper/api/v1alpha1"
+	"github.com/distribution/reference"
+	kuikv1alpha1 "github.com/enix/kube-image-keeper/api/kuik/v1alpha1"
 	"github.com/enix/kube-image-keeper/internal/metrics"
 	"github.com/enix/kube-image-keeper/internal/registry"
 	"github.com/gin-gonic/gin"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"golang.org/x/exp/slices"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -37,7 +41,7 @@ func New(k8sClient client.Client, metricsAddr string, insecureRegistries []strin
 	collector := NewCollector()
 	return &Proxy{
 		k8sClient:          k8sClient,
-		engine:             gin.Default(),
+		engine:             gin.New(),
 		collector:          collector,
 		exporter:           metrics.New(collector, metricsAddr),
 		insecureRegistries: insecureRegistries,
@@ -55,14 +59,24 @@ func NewWithEngine(k8sClient client.Client, engine *gin.Engine) *Proxy {
 func (p *Proxy) Serve() *Proxy {
 	r := p.engine
 
-	r.Use(recoveryMiddleware())
-	r.Use(func(c *gin.Context) {
-		c.Next()
-		registry := c.Param("originRegistry")
-		if registry == "" {
-			return
-		}
-		p.collector.IncHTTPCall(registry, c.Writer.Status(), c.GetBool("cacheHit"))
+	r.Use(
+		gin.LoggerWithWriter(gin.DefaultWriter, "/readyz", "/healthz"),
+		recoveryMiddleware(),
+		func(c *gin.Context) {
+			c.Next()
+			registry := c.Param("originRegistry")
+			if registry == "" {
+				return
+			}
+			p.collector.IncHTTPCall(registry, c.Writer.Status(), c.GetBool("cacheHit"))
+		},
+	)
+
+	r.GET("/readyz", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	r.GET("/healthz", func(c *gin.Context) {
+		c.Status(http.StatusOK)
 	})
 
 	v2 := r.Group("/v2")
@@ -78,7 +92,7 @@ func (p *Proxy) Serve() *Proxy {
 
 			subMatches := pathRegex.FindStringSubmatch(subPath)
 			if subMatches == nil {
-				c.Status(404)
+				c.Status(http.StatusNotFound)
 				return
 			}
 
@@ -108,11 +122,11 @@ func (p *Proxy) Serve() *Proxy {
 	return p
 }
 
-func (p *Proxy) Run() chan struct{} {
+func (p *Proxy) Run(proxyAddr string) chan struct{} {
 	p.Serve()
 	finished := make(chan struct{})
 	go func() {
-		if err := p.engine.Run(":8082"); err != nil {
+		if err := p.engine.Run(proxyAddr); err != nil {
 			panic(err)
 		}
 		finished <- struct{}{}
@@ -130,19 +144,31 @@ func (p *Proxy) Run() chan struct{} {
 
 // https://distribution.github.io/distribution/spec/api/#api-version-check
 func (p *Proxy) v2Endpoint(c *gin.Context) {
-	c.JSON(200, map[string]string{})
+	c.Header("Docker-Distribution-Api-Version", "registry/2.0")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.JSON(http.StatusOK, map[string]string{})
 }
 
 func (p *Proxy) routeProxy(c *gin.Context) {
-	repository := c.Param("repository")
+	repositoryName := c.Param("repository")
 	originRegistry := c.Param("originRegistry")
 
-	klog.InfoS("proxying request", "repository", repository, "originRegistry", originRegistry)
+	klog.InfoS("proxying request", "repository", repositoryName, "originRegistry", originRegistry)
 
 	if err := p.proxyRegistry(c, registry.Protocol+registry.Endpoint, false, nil); err != nil {
 		klog.InfoS("cached image is not available, proxying origin", "originRegistry", originRegistry, "error", err)
 
-		transport, err := p.getAuthentifiedTransport(originRegistry, repository)
+		repository, err := p.getRepository(originRegistry, repositoryName)
+		if err != nil {
+			if statusError, isStatus := err.(*apierrors.StatusError); isStatus && statusError.ErrStatus.Code != 0 {
+				_ = c.AbortWithError(int(statusError.ErrStatus.Code), err)
+			} else {
+				_ = c.AbortWithError(http.StatusInternalServerError, err)
+			}
+			return
+		}
+
+		transport, err := p.getAuthentifiedTransport(repository, "https://"+originRegistry)
 		if err != nil {
 			_ = c.AbortWithError(http.StatusUnauthorized, err)
 			return
@@ -156,8 +182,8 @@ func (p *Proxy) routeProxy(c *gin.Context) {
 		if err != nil {
 			klog.Errorf("could not proxy registry: %s", err)
 			_ = c.AbortWithError(http.StatusInternalServerError, err)
-			return
 		}
+
 		return
 	}
 
@@ -225,45 +251,72 @@ func (p *Proxy) proxyRegistry(c *gin.Context, endpoint string, endpointIsOrigin 
 	return proxyError
 }
 
-func (p *Proxy) getAuthentifiedTransport(registryDomain string, repository string) (http.RoundTripper, error) {
-	repositoryLabel := registry.RepositoryLabel(registryDomain + "/" + repository)
-	cachedImages := &kuikenixiov1alpha1.CachedImageList{}
+func (p *Proxy) getRepository(registryDomain string, repositoryName string) (*kuikv1alpha1.Repository, error) {
+	sanitizedName := registry.SanitizeName(registryDomain + "/" + repositoryName)
 
-	klog.InfoS("listing CachedImages", "repositoryLabel", repositoryLabel)
-	if err := p.k8sClient.List(context.Background(), cachedImages, client.MatchingLabels{
-		kuikenixiov1alpha1.RepositoryLabelName: repositoryLabel,
-	}, client.Limit(1)); err != nil {
+	repository := &kuikv1alpha1.Repository{}
+	if err := p.k8sClient.Get(context.Background(), types.NamespacedName{Name: sanitizedName}, repository); err != nil {
 		return nil, err
 	}
 
-	if len(cachedImages.Items) == 0 {
-		return nil, errors.New("no CachedImage found for this repository")
-	}
+	return repository, nil
+}
 
-	cachedImage := cachedImages.Items[0] // Images from the same repository should need the same pull-secret
-	if len(cachedImage.Spec.PullSecretNames) == 0 {
-		return nil, nil // Not an error since not all images requires authentication to be pulled
-	}
-
-	keychain := registry.NewKubernetesKeychain(p.k8sClient, cachedImage.Spec.PullSecretsNamespace, cachedImage.Spec.PullSecretNames)
-
-	ref, err := name.ParseReference(cachedImage.Spec.SourceImage)
+func (p *Proxy) getKeychains(repository *kuikv1alpha1.Repository) ([]authn.Keychain, error) {
+	pullSecrets, err := repository.GetPullSecrets(p.k8sClient)
 	if err != nil {
 		return nil, err
 	}
 
-	auth, err := keychain.Resolve(ref.Context())
+	return registry.GetKeychains(repository.Spec.Name, pullSecrets)
+}
+
+func (p *Proxy) getAuthentifiedTransport(repository *kuikv1alpha1.Repository, originRegistry string) (http.RoundTripper, error) {
+	imageRef, err := name.ParseReference(repository.Spec.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	keychains, err := p.getKeychains(repository)
+	if err != nil {
+		return nil, err
+	}
+
+	var proxyErrors []error
+	for _, keychain := range keychains {
+		transport, err := p.getAuthentifiedTransportWithKeychain(imageRef.Context(), keychain)
+		if err != nil {
+			proxyErrors = append(proxyErrors, err)
+			continue
+		}
+
+		client := &http.Client{Transport: transport}
+
+		// if :latest doesn't exist, it will respond with 404 so we still can know that this transport is well authentified (!= 401)
+		resp, err := client.Head(originRegistry + "/v2/" + imageRef.Context().RepositoryStr() + "/manifests/latest")
+		if err != nil {
+			proxyErrors = append(proxyErrors, err)
+		} else if resp.StatusCode != http.StatusUnauthorized {
+			return transport, nil
+		}
+	}
+
+	return nil, utilerrors.NewAggregate(proxyErrors)
+}
+
+func (p *Proxy) getAuthentifiedTransportWithKeychain(repository name.Repository, keychain authn.Keychain) (http.RoundTripper, error) {
+	auth, err := keychain.Resolve(repository)
 	if err != nil {
 		return nil, err
 	}
 
 	originalTransport := http.DefaultTransport.(*http.Transport).Clone()
 	originalTransport.TLSClientConfig = &tls.Config{RootCAs: p.rootCAs}
-	if slices.Contains(p.insecureRegistries, ref.Context().Registry.RegistryStr()) {
+	if slices.Contains(p.insecureRegistries, repository.Registry.RegistryStr()) {
 		originalTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
-	return transport.NewWithContext(context.Background(), ref.Context().Registry, auth, originalTransport, []string{ref.Scope(transport.PullScope)})
+	return transport.NewWithContext(context.Background(), repository.Registry, auth, originalTransport, []string{repository.Scope(transport.PullScope)})
 }
 
 // See https://github.com/golang/go/issues/28239, https://github.com/golang/go/issues/23643 and https://github.com/golang/go/issues/56228

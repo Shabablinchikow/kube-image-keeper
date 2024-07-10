@@ -1,4 +1,20 @@
-package controllers
+/*
+Copyright 2024.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kuik
 
 import (
 	"context"
@@ -8,12 +24,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
 	dockerClient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -22,9 +39,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	corev1 "k8s.io/api/core/v1"
-
-	kuikenixiov1alpha1 "github.com/enix/kube-image-keeper/api/v1alpha1"
+	kuikv1alpha1 "github.com/enix/kube-image-keeper/api/kuik/v1alpha1"
 	"github.com/enix/kube-image-keeper/internal/registry"
 	//+kubebuilder:scaffold:imports
 )
@@ -38,20 +53,15 @@ var testEnv *envtest.Environment
 var ctx context.Context
 var cancel context.CancelFunc
 var registryContainerId string
-
-func TestAPIs(t *testing.T) {
-	RegisterFailHandler(Fail)
-
-	RunSpecs(t, "Controller Suite")
-}
+var dockerClientApiVersion = os.Getenv("DOCKER_CLIENT_API_VERSION")
 
 func setupRegistry() {
-	client, err := dockerClient.NewClientWithOpts(dockerClient.FromEnv)
+	client, err := dockerClient.NewClientWithOpts(dockerClient.FromEnv, dockerClient.WithVersion(dockerClientApiVersion))
 	Expect(err).NotTo(HaveOccurred())
 
 	// Pull image
 	ctx := context.Background()
-	reader, err := client.ImagePull(ctx, "registry", types.ImagePullOptions{})
+	reader, err := client.ImagePull(ctx, "registry", image.PullOptions{})
 	Expect(err).NotTo(HaveOccurred())
 	_, err = io.Copy(os.Stdout, reader)
 	Expect(err).NotTo(HaveOccurred())
@@ -72,7 +82,7 @@ func setupRegistry() {
 	registryContainerId = resp.ID
 
 	// Start container
-	err = client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
+	err = client.ContainerStart(ctx, resp.ID, container.StartOptions{})
 	Expect(err).NotTo(HaveOccurred())
 
 	// Configure registry endpoint
@@ -92,23 +102,29 @@ func setupRegistry() {
 }
 
 func removeRegistry() {
-	client, err := dockerClient.NewClientWithOpts(dockerClient.FromEnv)
+	client, err := dockerClient.NewClientWithOpts(dockerClient.FromEnv, dockerClient.WithVersion(dockerClientApiVersion))
 	Expect(err).NotTo(HaveOccurred())
 
-	err = client.ContainerRemove(context.Background(), registryContainerId, types.ContainerRemoveOptions{
+	err = client.ContainerRemove(context.Background(), registryContainerId, container.RemoveOptions{
 		Force: true,
 	})
 	Expect(err).NotTo(HaveOccurred())
 }
 
+func TestControllers(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	RunSpecs(t, "Controller Suite")
+}
+
 var _ = BeforeSuite(func() {
-	logf.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseDevMode(true)))
+	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
 	ctx, cancel = context.WithCancel(context.TODO())
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -118,10 +134,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
-	err = kuikenixiov1alpha1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = corev1.AddToScheme(scheme.Scheme)
+	err = kuikv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	//+kubebuilder:scaffold:scheme
@@ -133,7 +146,8 @@ var _ = BeforeSuite(func() {
 	Expect(k8sClient).NotTo(BeNil())
 
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:             scheme.Scheme,
+		MetricsBindAddress: ":8081",
 	})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -146,17 +160,12 @@ var _ = BeforeSuite(func() {
 	}).SetupWithManager(k8sManager, 3)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = (&PodReconciler{
-		Client: k8sManager.GetClient(),
-		Scheme: k8sManager.GetScheme(),
-	}).SetupWithManager(k8sManager)
-	Expect(err).ToNot(HaveOccurred())
-
 	go func() {
 		defer GinkgoRecover()
 		err = k8sManager.Start(ctx)
 		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
 	}()
+
 })
 
 var _ = AfterSuite(func() {

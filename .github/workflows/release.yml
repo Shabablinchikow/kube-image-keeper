@@ -73,12 +73,14 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-22.04
+    env:
+      DOCKER_CLIENT_API_VERSION: '1.43' # 1.45 is not supported by ubuntu-22.04 GitHub image
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Golang
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           check-latest: true
@@ -87,7 +89,7 @@ jobs:
         uses: helm/chart-testing-action@v2.6.1
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v6
         with:
           version: latest
           args: --timeout 3m --verbose --issues-exit-code=0
@@ -148,7 +150,7 @@ jobs:
             ${{ env.QUAY_IMAGE }}
 
       - name: Build container images
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: repository
           platforms: linux/amd64,linux/arm64
@@ -161,7 +163,7 @@ jobs:
             ${{ env.HARBOR_URL }}/${{ env.HARBOR_REPO }}:${{ env.VERSION }}
 
       - name: Build alpine container images
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: repository
           platforms: linux/amd64,linux/arm64
@@ -173,8 +175,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: |
             ${{ env.HARBOR_URL }}/${{ env.HARBOR_REPO }}:${{ env.VERSION }}-alpine
-  e2e:
-    name: Tests End-to-End on K8s
+
+  e2e_install:
+    name: Tests e2e on K8s (Fresh install)
     needs:
       - build
     runs-on: ubuntu-22.04
@@ -187,13 +190,145 @@ jobs:
     strategy:
       max-parallel: 6
       matrix:
-        k8sversion: ["v1.21.14", "v1.22.17", "v1.23.17", "v1.24.15", "v1.25.11", "v1.26.6", "v1.27.3", "v1.28.0"]
+        k8sversion: ["v1.24.17", "v1.25.16", "v1.26.14", "v1.27.11", "v1.28.7", "v1.29.2"]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup KinD
-        uses: helm/kind-action@v1.8.0
+        uses: helm/kind-action@v1.10.0
+        with:
+          node_image: kindest/node:${{ matrix.k8sversion }}
+
+      - name: Run cert-manager installation
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.11.0/cert-manager.yaml
+          kubectl wait pods -n cert-manager -l app.kubernetes.io/instance=cert-manager --for condition=Ready --timeout=90s
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.6.1
+
+      - name: Set up helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.9.0'
+
+      - name: Run chart-testing (lint)
+        run: |
+          set -euo pipefail
+          ct lint \
+            --charts helm/kube-image-keeper \
+            --chart-repos bitnami=https://charts.bitnami.com/bitnami \
+            --validate-maintainers=false --check-version-increment=false
+
+      - name: Run helm (install)
+        run : |
+          set -euo pipefail
+          kubectl create namespace kuik-system
+          kubectl create secret docker-registry harbor-secret -n kuik-system --docker-server=${{ env.HARBOR_REGISTRY }} \
+            --docker-username="$HARBOR_USERNAME" --docker-password="$HARBOR_PASSWORD"
+          helm upgrade --install kube-image-keeper -n kuik-system --create-namespace ./helm/kube-image-keeper \
+            --set controllers.image.tag=$VERSION --set proxy.image.tag=$VERSION \
+            --set controllers.image.repository=$HARBOR_IMAGE --set proxy.image.repository=$HARBOR_IMAGE \
+            --set controllers.imagePullSecrets[0].name=harbor-secret --set proxy.image.imagePullSecrets[0].name=harbor-secret  --debug
+          kubectl wait pods -n kuik-system -l app.kubernetes.io/instance=kube-image-keeper --for condition=Ready --timeout=90s
+          helm history kube-image-keeper -n kuik-system
+
+      - name: Deploy test container
+        run: |
+          set -euo pipefail
+          kubectl create deploy nginx --image=nginx:stable-alpine --replicas=2
+          kubectl rollout status deploy nginx
+          kubectl wait deployment nginx --for condition=Available=True --timeout=30s
+          echo "kubectl get cachedimage"
+          kubectl get cachedimages
+          echo "kubectl get repository"
+          kubectl get repository
+
+      - name: Test cachedimage (CRD)
+        run: |
+          set -euo pipefail
+          ## Check if our test image is cached
+          if [ $(kubectl get cachedimages docker.io-library-nginx-stable-alpine -o json | jq ".status.isCached") ];
+          then
+              if [ $(kubectl get cachedimages docker.io-library-nginx-stable-alpine -o json | jq ".status.usedBy.count") -eq 2 ];
+              then
+                  echo "Found cached image used by 2 pods"
+              else
+                  echo "Error: pods count should be equal 2"
+                  exit 1
+              fi
+          else
+              echo "Error: image cached status is false"
+              exit 1
+          fi
+
+      - name: Test repository (CRD)
+        run: |
+          set -euo pipefail
+          ## Check repository status
+          if [ $(kubectl get repository docker.io-library-nginx -o json | jq '.status.phase') == '"Ready"' ] ;
+          then
+              echo "Found repository"
+          else
+              echo "Error: image repository status is not Ready"
+              exit 1
+          fi
+
+      - name: Test metrics endpoint
+        run: |
+          set -euo pipefail
+          ## Check for kuik's components metrics
+          for component in proxy controllers
+          do
+            echo "Testing $component metrics endpoint"
+            for ip in $(kubectl get po -l "app.kubernetes.io/component=$component" -n kuik-system -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')
+            do
+               attempts=0
+               success=false
+               while [[ $attempts -lt 3 && $success == false ]]
+               do
+                   response=$(kubectl run curl-pod --image=curlimages/curl --rm -ti --quiet --restart=Never -- curl -s -o /dev/null -w "%{http_code}\n" http://$ip:8080/metrics)
+                   if [[ -z "$response" ]]; then
+                        echo "No HTTP response received from $ip"
+                   elif [[ $response -ge 200 && $response -lt 300 ]]; then
+                        echo "HTTP status code $response is valid for $ip"
+                        success=true
+                   else
+                        echo "HTTP status code $response is not valid for $ip"
+                   fi
+                   attempts=$(( $attempts + 1 ))
+                   sleep 3
+               done
+               if [[ $success == false ]]; then
+                   echo "Failed after 3 attempts for $ip"
+                   exit 1
+               fi
+            done
+          done
+
+  e2e_upgrade:
+    name: Tests e2e on K8s (Upgrade)
+    needs:
+      - build
+      - e2e_install
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ github.run_id }}
+      HARBOR_IMAGE: "harbor.enix.io/kube-image-keeper/kube-image-keeper"
+      HARBOR_REGISTRY: "harbor.enix.io"
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+    strategy:
+      max-parallel: 6
+      matrix:
+        k8sversion: ["v1.24.17", "v1.25.16", "v1.26.14", "v1.27.11", "v1.28.7", "v1.29.2"]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup KinD
+        uses: helm/kind-action@v1.10.0
         with:
           node_image: kindest/node:${{ matrix.k8sversion }}
 
@@ -206,7 +341,7 @@ jobs:
         uses: helm/chart-testing-action@v2.6.1
 
       - name: Set up helm
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v4
         with:
           version: '3.9.0'
 
@@ -218,36 +353,46 @@ jobs:
             --chart-repos bitnami=https://charts.bitnami.com/bitnami \
             --validate-maintainers=false --check-version-increment=false
 
-# Need wait for the next release with flag --skip-clean-up
-#      - name: Run chart-testing (install)
-#        run: |
-#          set -euo pipefail
-#          ct install \
-#            --charts helm/kube-image-keeper \
-#            --helm-extra-set-args "--set controllers.image.tag=latest --set proxy.image.tag=latest"
-
-      - name: Run helm (install)
+      - name: Run helm (install latest release)
         run : |
           set -euo pipefail
-          kubectl create namespace kuik-system
+          helm repo add enix https://charts.enix.io/
+          helm repo update
+          helm upgrade --install kube-image-keeper -n kuik-system --create-namespace enix/kube-image-keeper --debug
+          kubectl wait pods -n kuik-system -l app.kubernetes.io/instance=kube-image-keeper --for condition=Ready --timeout=30s
+          kubectl get po -n kuik-system
+
+      - name: Run helm (upgrade)
+        run : |
+          set -euo pipefail
           kubectl create secret docker-registry harbor-secret -n kuik-system --docker-server=${{ env.HARBOR_REGISTRY }} \
             --docker-username="$HARBOR_USERNAME" --docker-password="$HARBOR_PASSWORD"
           helm upgrade --install kube-image-keeper -n kuik-system --create-namespace ./helm/kube-image-keeper \
             --set controllers.image.tag=$VERSION --set proxy.image.tag=$VERSION \
             --set controllers.image.repository=$HARBOR_IMAGE --set proxy.image.repository=$HARBOR_IMAGE \
-            --set controllers.imagePullSecrets[0].name=harbor-secret --set proxy.image.imagePullSecrets[0].name=harbor-secret  --debug
-          kubectl wait pods -n kuik-system -l app.kubernetes.io/instance=kube-image-keeper --for condition=Ready --timeout=30s
+            --set controllers.imagePullSecrets[0].name=harbor-secret --set proxy.image.imagePullSecrets[0].name=harbor-secret --wait --debug
+          kubectl rollout status deploy kube-image-keeper-controllers -n kuik-system
+          kubectl rollout status ds kube-image-keeper-proxy -n kuik-system
+          helm history kube-image-keeper -n kuik-system
 
-      - name: Run end-to-end tests
+      - name: Deploy test container
         run: |
           set -euo pipefail
           kubectl create deploy nginx --image=nginx:stable-alpine --replicas=2
+          kubectl rollout status deploy nginx
           kubectl wait deployment nginx --for condition=Available=True --timeout=30s
-          echo "kubectl get cachedimages"
+          echo "kubectl get cachedimage"
           kubectl get cachedimages
-          if [ $(kubectl get cachedimages -o json | jq ".items[0].status.isCached") ];
+          echo "kubectl get repository"
+          kubectl get repository
+
+      - name: Test cachedimage (CRD)
+        run: |
+          set -euo pipefail
+          ## Check if our test image is cached
+          if [ $(kubectl get cachedimages docker.io-library-nginx-stable-alpine -o json | jq ".status.isCached") ];
           then
-              if [ $(kubectl get cachedimages -o json | jq ".items[0].status.usedBy.count") -eq 2 ];
+              if [ $(kubectl get cachedimages docker.io-library-nginx-stable-alpine -o json | jq ".status.usedBy.count") -eq 2 ];
               then
                   echo "Found cached image used by 2 pods"
               else
@@ -259,10 +404,54 @@ jobs:
               exit 1
           fi
 
+      - name: Test repository (CRD)
+        run: |
+          set -euo pipefail
+          ## Check repository status
+          if [ $(kubectl get repository docker.io-library-nginx -o json | jq '.status.phase') == '"Ready"' ] ;
+          then
+              echo "Found repository"
+          else
+              echo "Error: image repository status is not Ready"
+              exit 1
+          fi
+
+      - name: Test metrics endpoint
+        run: |
+          set -euo pipefail
+          ## Check for kuik's components metrics
+          for component in proxy controllers
+          do
+            echo "Testing $component metrics endpoint"
+            for ip in $(kubectl get po -l "app.kubernetes.io/component=$component" -n kuik-system -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}')
+            do
+               attempts=0
+               success=false
+               while [[ $attempts -lt 3 && $success == false ]]
+               do
+                   response=$(kubectl run curl-pod --image=curlimages/curl --rm -ti --quiet --restart=Never -- curl -s -o /dev/null -w "%{http_code}\n" http://$ip:8080/metrics)
+                   if [[ -z "$response" ]]; then
+                        echo "No HTTP response received from $ip"
+                   elif [[ $response -ge 200 && $response -lt 300 ]]; then
+                        echo "HTTP status code $response is valid for $ip"
+                        success=true
+                   else
+                        echo "HTTP status code $response is not valid for $ip"
+                   fi
+                   attempts=$(( $attempts + 1 ))
+                   sleep 3
+               done
+               if [[ $success == false ]]; then
+                   echo "Failed after 3 attempts for $ip"
+                   exit 1
+               fi
+            done
+          done
+
   release:
     name: Release
     needs:
-      - e2e
+      - e2e_upgrade
       - semver
     runs-on: ubuntu-22.04
     outputs:
@@ -312,7 +501,7 @@ jobs:
         run: |
           from lib import *
           import os
-          
+
           header('semantic-release job outputs')
           info('last      = {}'.format(os.environ['SR_LAST']))
           info('published = {}'.format(os.environ['SR_PUBLISHED']))
@@ -366,7 +555,7 @@ jobs:
           path: repository
 
       - name: Set up helm
-        uses: azure/setup-helm@v3
+        uses: azure/setup-helm@v4
         with:
           version: '3.9.0'
 
@@ -376,10 +565,10 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
+
       - name: Cache for chart-releaser
         id: cache-cr
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: bin/cr
           key: ${{ runner.os }}-cr-${{ env.CR_VERSION }}
@@ -394,7 +583,7 @@ jobs:
 
       - name: Cache for helm-docs
         id: cache-helm-docs
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: bin/helm-docs
           key: ${{ runner.os }}-helm-docs-${{ env.HELM_DOCS_VERSION }}
@@ -413,7 +602,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Login to GHCR 
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -437,7 +626,7 @@ jobs:
             ${{ env.GHCR_IMAGE }}
 
       - name: Build container images
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: repository
           platforms: linux/amd64,linux/arm64
@@ -452,7 +641,7 @@ jobs:
             ${{ env.GHCR_IMAGE }}:${{ env.VERSION }}
 
       - name: Push container images tag (Latest)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         if: ${{ env.PRERELEASE != 'true' }}
         with:
           context: repository
@@ -466,9 +655,9 @@ jobs:
             ${{ github.repository }}:latest
             ${{ env.QUAY_IMAGE }}:latest
             ${{ env.GHCR_IMAGE }}:latest
-      
+
       - name: Push container images tag (Release)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: repository
           platforms: linux/amd64,linux/arm64
@@ -483,7 +672,7 @@ jobs:
             ${{ env.GHCR_IMAGE }}:${{ env.VERSION }}
 
       - name: Push alpine container images tag (Release)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: repository
           platforms: linux/amd64,linux/arm64
@@ -579,7 +768,7 @@ jobs:
                           links.append({
                               'name': 'GitHub issue #{}'.format(issue.group('id')),
                               'url': issue.group('url')
-                          })        
+                          })
 
                   entry = {
                       'kind': kind,
@@ -619,7 +808,7 @@ jobs:
         run: |
           from lib import *
           import os, yaml, shutil
-          
+
           chart_path = os.path.join(os.environ['WORKSPACE'], 'repository', 'helm', 'kube-image-keeper')
           os.chdir(chart_path)
 
@@ -669,7 +858,7 @@ jobs:
               print(yaml.safe_load(open(yaml_file, 'r')))
 
           header('release the chart')
-          
+
           action('clone helm charts repository')
           charts_repo = os.path.join(os.environ['WORKSPACE'], 'enix-charts')
           run('git', 'clone', 'https://github.com/enix/helm-charts', charts_repo)
@@ -695,6 +884,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Delete assets artifact
-        uses: geekyeggo/delete-artifact@v2
+        uses: geekyeggo/delete-artifact@v5
         with:
           name: binaries

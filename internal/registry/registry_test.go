@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/ghttp"
@@ -144,6 +145,10 @@ func Test_ImageIsCached(t *testing.T) {
 			Endpoint = server.Addr()
 			isCached, err := ImageIsCached(tt.image)
 			if tt.wantErr != "" {
+				err2 := errors.Unwrap(err)
+				if err2 != nil {
+					err = err2
+				}
 				g.Expect(err).To(BeAssignableToTypeOf(tt.errType))
 				g.Expect(err).To(MatchError(ContainSubstring(tt.wantErr)))
 			} else {
@@ -236,27 +241,6 @@ func Test_CacheImage(t *testing.T) {
 			image: "alpine",
 		},
 		{
-			name:    "Basic",
-			image:   "*****",
-			wantErr: "could not parse reference",
-			errType: &name.ErrBadName{},
-		},
-		{
-			name:       "Image not found",
-			image:      "image-not-found",
-			httpStatus: http.StatusNotFound,
-			wantErr:    "could not find source image",
-			errType:    errors.New(""),
-		},
-		{
-			name:         "Unauthorized",
-			image:        "alpine",
-			httpStatus:   http.StatusUnauthorized,
-			httpResponse: "unauthorized",
-			wantErr:      "unauthorized",
-			errType:      &transport.Error{},
-		},
-		{
 			name:            "Could not write",
 			image:           "alpine",
 			putHttpStatus:   http.StatusUnauthorized,
@@ -328,8 +312,15 @@ func Test_CacheImage(t *testing.T) {
 			)
 
 			Endpoint = cacheRegistry.Addr()
-			keychain := NewKubernetesKeychain(nil, "default", []string{})
-			err := CacheImage(originRegistry.Addr()+"/"+tt.image, keychain, []string{"amd64"}, []string{}, nil)
+			imageName := originRegistry.Addr() + "/" + tt.image
+
+			sourceRef, err := name.ParseReference(imageName)
+			g.Expect(err).To(BeNil())
+
+			desc, err := remote.Get(sourceRef)
+			g.Expect(err).To(BeNil())
+
+			err = CacheImage(imageName, desc, []string{"amd64"})
 			if tt.wantErr != "" {
 				g.Expect(err).To(BeAssignableToTypeOf(tt.errType))
 				g.Expect(err).To(MatchError(ContainSubstring(tt.wantErr)))

@@ -6,6 +6,7 @@
 *.dylib
 bin
 testbin/*
+Dockerfile.cross
 
 # Test binary, build with `go test -c`
 *.test
@@ -20,6 +21,7 @@ zz_generated.*
 
 # editor and IDE paraphernalia
 .idea
+.vscode
 *.swp
 *.swo
 *~

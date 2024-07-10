@@ -1,9 +1,9 @@
 # Build the manager binary
-FROM --platform=${BUILDPLATFORM} golang:1.20-alpine3.17 AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.22-alpine3.19 AS builder
 
 WORKDIR /workspace
 
-RUN go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.8.0
+RUN go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.15.0
 
 # Copy the Go Modules manifests
 COPY go.mod go.mod
@@ -13,9 +13,7 @@ COPY go.sum go.sum
 RUN go mod download
 
 # Copy the go source
-COPY main.go main.go
 COPY api/ api/
-COPY controllers/ controllers/
 COPY cmd/ cmd/
 COPY internal/ internal/
 
@@ -33,13 +31,14 @@ ENV LD_FLAGS="\
     -X 'github.com/enix/kube-image-keeper/internal/metrics.Revision=${REVISION}' \
     -X 'github.com/enix/kube-image-keeper/internal/metrics.BuildDateTime=BUILD_DATE_TIME'"
 
-RUN BUILD_DATE_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S") && \
+RUN --mount=type=cache,target="/root/.cache/go-build" \
+    BUILD_DATE_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S") && \
     LD_FLAGS=$(/bin/ash -c "set -o pipefail && echo $LD_FLAGS | sed -e \"s/BUILD_DATE_TIME/$BUILD_DATE_TIME/g\"") && \
     controller-gen object paths="./..." && \
-    go build -a -ldflags="$LD_FLAGS" -o manager cmd/cache/main.go && \
-    go build -a -ldflags="$LD_FLAGS" -o registry-proxy cmd/proxy/main.go
+    go build -ldflags="$LD_FLAGS" -o manager cmd/cache/main.go && \
+    go build -ldflags="$LD_FLAGS" -o registry-proxy cmd/proxy/main.go
 
-FROM alpine:3.17 AS alpine
+FROM alpine:3.19 AS alpine
 
 COPY --from=builder /workspace/manager /usr/local/bin/
 COPY --from=builder /workspace/registry-proxy /usr/local/bin/
