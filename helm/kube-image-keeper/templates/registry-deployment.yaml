@@ -55,6 +55,8 @@ spec:
             {{- if (not (empty .Values.registry.persistence.gcs))}}
             - name: REGISTRY_STORAGE
               value: gcs
+            {{- end}}
+            {{- if (not (empty .Values.registry.persistence.gcsExistingSecret)) }}
             - name: REGISTRY_STORAGE_GCS_KEYFILE
               value: "/etc/registry/keys/credentials.json"
             {{- end}}
